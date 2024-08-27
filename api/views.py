@@ -1,30 +1,47 @@
 # api/views.py
 
+from datetime import datetime
 from django.contrib.auth.decorators import login_required
 import logging
 from django.http import HttpResponse, JsonResponse
+from django.db import IntegrityError
 from django.shortcuts import render, redirect
-from django.contrib.auth import authenticate, login
+from django.contrib.auth import authenticate, login, get_user_model
 from django.contrib.auth.models import User
 from django.views import View
+from rest_framework.views import APIView
 from rest_framework.response import Response
+from django.contrib.auth.hashers import make_password
+from django.core.mail import send_mail
+from django.contrib.auth.password_validation import validate_password
 from rest_framework import status
 from rest_framework import generics
+from django.db.models import Count
+from django.utils import timezone
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.views import csrf_exempt
 from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework_simplejwt.tokens import RefreshToken
+from datetime import timedelta
+from django_ratelimit.decorators import ratelimit
+from django.contrib.auth.hashers import make_password, check_password
+from django.views.decorators.http import require_http_methods
+from django.conf import settings
 import csv
 import json
-from .models import PasswordEntry, SecureNote, CreditCard, IdentityCard, EncryptionKey, PasswordEntry, PasswordShare
+from .models import PasswordEntry, SecureNote, CreditCard, IdentityCard, EncryptionKey, PasswordEntry, PasswordShare, Log
 from .serializers import (
     PasswordEntrySerializer, SecureNoteSerializer,
     CardSerializer, IdentitySerializer,
     EncryptionKeySerializer, UserSerializer,
-    PasswordShareSerializer, PasswordImportSerializer,PasswordExportSerializer
+    PasswordShareSerializer, PasswordImportSerializer,PasswordExportSerializer, LogSerializer, TwoFactorSerializer
 )
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+User = get_user_model()
+
 
 
 ################### obtention de token d'authetification ##########################
@@ -40,6 +57,12 @@ class UserListView(generics.ListAPIView):
     queryset = User.objects.all()
     serializer_class = UserSerializer
     permission_classes = [IsAuthenticated]
+    def get(self, request, *args, **kwargs):
+        token = request.headers.get('Authorization')
+        print(f'Token: {token}')  # Log the token for debugging purposes
+        return super().get(request, *args, **kwargs)
+    def get_queryset(self):
+        return User.objects.exclude(username='admin')
 
 class UserDetailView(generics.RetrieveAPIView):
     queryset = User.objects.all()
@@ -164,76 +187,188 @@ def check_password(request):
     strength = check_password_strength(password)
     return JsonResponse({"strength": strength})
 
+
+
+################### admin delete ##########################
+class UserDeleteView(generics.DestroyAPIView):
+    queryset = User.objects.all()
+    serializer_class = UserSerializer
+    permission_classes = [IsAuthenticated]
+################### admin edit ##########################
+class UserUpdateView(generics.UpdateAPIView):
+    queryset = User.objects.all()
+    serializer_class = UserSerializer
+    permission_classes = [IsAuthenticated]
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        data = request.data
+
+        # Handle password update separately
+        password = data.pop('password', None)
+
+        serializer = self.get_serializer(instance, data=data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+
+        if password:
+            instance.set_password(password)
+            instance.save()
+
+        return Response(serializer.data)
+################### admin password leak ##########################
+logger = logging.getLogger(__name__)
+
+class NotifyPasswordLeakView(APIView):
+    def post(self, request, pk):
+        try:
+            logger.debug(f"Notifying user with ID: {pk}")
+            user = User.objects.get(pk=pk)
+            site_name = request.data.get('site_name')  # Récupère le nom du site depuis la requête
+            if not site_name:
+                logger.error("site_name is missing in the request.")
+                return Response({'error': 'site_name is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Envoyer un e-mail à l'utilisateur
+            subject = "Mot de passe compromis pour votre compte"
+            message = f"Bonjour {user.username},\n\nVotre mot de passe pour le site '{site_name}' a été signalé comme compromis. Nous vous recommandons de le changer immédiatement."
+            email_from = settings.DEFAULT_FROM_EMAIL
+            recipient_list = [user.email]
+            send_mail(subject, message, email_from, recipient_list)
+
+            return Response({'message': 'User notified successfully.'}, status=status.HTTP_200_OK)
+        except User.DoesNotExist:
+            logger.error("User not found.")
+            return Response({'error': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}", exc_info=True)
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        
+
+def notify_user_by_email(user, site_name):
+    subject = "Mot de passe compromis pour votre compte"
+    message = f"Bonjour {user.username},\n\nVotre mot de passe pour le site '{site_name}' a été signalé comme compromis. Nous vous recommandons de le changer immédiatement."
+    email_from = settings.DEFAULT_FROM_EMAIL
+    recipient_list = [user.email]
+    send_mail(subject, message, email_from, recipient_list)
+    
+################### admin stat ##########################
+class StatisticsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        logger = logging.getLogger(__name__)
+        try:
+            total_users = User.objects.count()
+            latest_user = User.objects.latest('date_joined')
+            latest_user_joined = latest_user.date_joined
+            user_activity = User.objects.filter(last_login__gte=timezone.now() - timedelta(days=30)).count()
+
+            users = User.objects.all()
+            user_data = []
+            for user in users:
+                user_data.append({
+                    'username': user.username,
+                    'date_joined': user.date_joined,
+                    'last_login': user.last_login,
+                })
+
+            data = {
+                'total_users': total_users,
+                'latest_user_joined': latest_user_joined,
+                'user_activity': user_activity,
+                'users': user_data
+            }
+            logger.info(f"Statistics data prepared: {data}")
+            return Response(data)
+        except Exception as e:
+            logger.error(f"Error in StatisticsView: {e}")
+            return Response({'error': 'Internal Server Error'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+
 ################### partage de mots de passe ##########################
+
+logger = logging.getLogger(__name__)
 
 @api_view(['POST', 'GET'])
 @permission_classes([IsAuthenticated])
 def share_password(request):
     if request.method == 'POST':
         try:
+            # Récupération des données du POST
             shared_with_user_id = request.data.get('shared_with_user_id')
-            shared_by_user_id = request.data.get('shared_by_user_id')
+            shared_by_user_id = request.user.id  # Utilisez l'utilisateur connecté
             password_entry_id = request.data.get('password_entry_id')
             expiration_date = request.data.get('expiration_date')
 
-            # Vérifier si l'utilisateur destinataire existe
+            logger.debug(f"expiration_date (before conversion): {expiration_date}")
+
+            # Convertir l'expiration_date en datetime aware
+            if expiration_date:
+                expiration_date = timezone.make_aware(
+                    datetime.strptime(expiration_date, "%Y-%m-%dT%H:%M:%S.%f")
+                )
+            logger.debug(f"expiration_date (after conversion): {expiration_date}")
+
+            # Vérifier si l'utilisateur avec lequel partager existe
             shared_with_user = User.objects.get(id=shared_with_user_id)
 
-            # Vérifier si l'utilisateur envoyeur existe
-            shared_by_user = User.objects.get(id=shared_by_user_id)
-
-            # Récupérer l'entrée de mot de passe à partager
+            # Vérifier si l'entrée de mot de passe existe
             password_entry = PasswordEntry.objects.get(id=password_entry_id)
 
-            # Créer une instance de PasswordShare
+            # Vérifier si cette combinaison existe déjà
+            if PasswordShare.objects.filter(password_entry=password_entry, shared_with_user=shared_with_user, shared_by_user=request.user).exists():
+                return Response({'error': 'This password has already been shared with this user.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Créer et sauvegarder l'objet PasswordShare
             password_share = PasswordShare.objects.create(
                 password_entry=password_entry,
                 shared_with_user=shared_with_user,
-                shared_by_user=shared_by_user,
+                shared_by_user=request.user,
                 expiration_date=expiration_date
             )
+            logger.debug(f"password_share created: {password_share}")
 
-            # Serializer l'instance de PasswordShare
+            # Sérialiser l'instance de PasswordShare
             serializer = PasswordShareSerializer(password_share)
-
-            # Retourner la réponse avec les données sérialisées
             return Response(serializer.data, status=status.HTTP_201_CREATED)
+        
+        except User.DoesNotExist:
+            logger.error("Shared with user not found")
+            return Response({'error': 'Shared with user not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        except PasswordEntry.DoesNotExist:
+            logger.error("Password entry not found")
+            return Response({'error': 'Password entry not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        except IntegrityError as e:
+            logger.error(f"Integrity error occurred: {e}")
+            return Response({'error': 'An integrity error occurred, possibly due to a duplicate entry.'}, status=status.HTTP_400_BAD_REQUEST)
+
         except Exception as e:
-            # En cas d'erreur, retourner un message d'erreur
+            logger.error(f"Exception occurred: {e}")
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
     elif request.method == 'GET':
         try:
-            # Filtrer les mots de passe partagés avec l'utilisateur connecté
+            # Filtrer les mots de passe partagés avec l'utilisateur connecté, non expirés
             shared_passwords = PasswordShare.objects.filter(shared_with_user=request.user)
 
-            # Initialiser une liste pour stocker les données sérialisées
-            serialized_data = []
-
-            # Boucler sur les mots de passe partagés pour les sérialiser
-            for shared_password in shared_passwords:
-                # Créer un dictionnaire avec les données nécessaires
-                data = {
-                    'id': shared_password.id,
-                    'password_entry_id': shared_password.password_entry.id,
-                    'site_name': shared_password.password_entry.site_name,
-                    'username': shared_password.password_entry.username,
-                    'expiration_date': shared_password.expiration_date,
-                    # Ajoutez d'autres champs si nécessaire
-                }
-                # Ajouter le dictionnaire à la liste
-                serialized_data.append(data)
+            # Sérialiser les mots de passe partagés
+            serializer = PasswordShareSerializer(shared_passwords, many=True)
 
             # Retourner les données sérialisées
-            return Response(serialized_data, status=status.HTTP_200_OK)
+            return Response(serializer.data, status=status.HTTP_200_OK)
 
         except Exception as e:
-            # En cas d'erreur, retourner un message d'erreur
+            logger.error(f"Exception occurred: {e}")
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
     else:
-        # Si la méthode HTTP n'est pas autorisée, retourner un message approprié
         return Response({'message': 'Method not allowed'}, status=status.HTTP_405_METHOD_NOT_ALLOWED)
-
-
 
 ################### import de mdp ##########################
 
@@ -243,34 +378,32 @@ def share_password(request):
 def import_passwords(request):
     if request.method == 'POST':
         try:
-            # Récupérer le format d'importation (JSON ou CSV)
             format = request.data.get('format')
             if format not in ['json', 'csv']:
                 return JsonResponse({"error": "Invalid import format specified"}, status=400)
 
             if format == 'json':
-                # Convertir les données JSON en dictionnaire
                 imported_data = json.loads(request.data.get('data'))
                 serializer = PasswordImportSerializer(data=imported_data, many=True)
             elif format == 'csv':
-                # Lire les données CSV et les convertir en dictionnaire
                 csv_data = request.FILES['file'].read().decode('utf-8').splitlines()
                 csv_reader = csv.DictReader(csv_data)
                 imported_data = list(csv_reader)
                 serializer = PasswordImportSerializer(data=imported_data, many=True)
             
             if serializer.is_valid():
-                # Enregistrer les mots de passe importés dans la base de données
                 serializer.save(user=request.user)
                 return JsonResponse({"status": "Passwords imported successfully"}, status=200)
             else:
                 return JsonResponse({"error": serializer.errors}, status=400)
         except Exception as e:
-            # En cas d'erreur, retourner un message d'erreur
+            # Log the exception for debugging
+            import traceback
+            traceback.print_exc()
             return JsonResponse({'error': str(e)}, status=500)
     else:
-        # Si la méthode HTTP n'est pas autorisée, retourner un message approprié
         return JsonResponse({'message': 'Method not allowed'}, status=405)
+
 
 
 
@@ -279,77 +412,139 @@ def import_passwords(request):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def export_passwords(request):
-    if request.method == 'POST':
-        try:
-            # Récupérer tous les mots de passe de l'utilisateur actuel
-            passwords = PasswordEntry.objects.filter(user=request.user)
-            
-            # Vérifier le format demandé (JSON ou CSV)
-            format = request.data.get('format', 'json')  # Par défaut, exportation en JSON
-            
-            if format == 'json':
-                # Sérialiser les mots de passe en JSON
-                passwords_data = [{'id': p.id, 'user': p.user.id, 'site_name': p.site_name, 'site_url': p.site_url, 
-                                   'username': p.username, 'password': p.password, 'created_at': p.created_at, 
-                                   'updated_at': p.updated_at} for p in passwords]
+    try:
+        # Récupérer tous les mots de passe de l'utilisateur actuel
+        passwords = PasswordEntry.objects.filter(user=request.user)
 
-                # Retourner les mots de passe exportés au format JSON
-                return JsonResponse(passwords_data, safe=False)
-            elif format == 'csv':
-                # Créer un fichier CSV temporaire
-                response = HttpResponse(content_type='text/csv')
-                response['Content-Disposition'] = 'attachment; filename="passwords.csv"'
+        # Vérifier le format demandé (JSON ou CSV)
+        export_format = request.data.get('format', 'json')
 
-                # Créer un écrivain CSV
-                writer = csv.writer(response)
-                # Écrire l'en-tête CSV
-                writer.writerow(['id', 'user', 'site_name', 'site_url', 'username', 'password', 'created_at', 'updated_at'])
-                # Écrire les données de chaque mot de passe dans le fichier CSV
-                for password in passwords:
-                    writer.writerow([password.id, password.user.id, password.site_name, password.site_url, 
-                                     password.username, password.password, password.created_at, password.updated_at])
+        if export_format == 'json':
+            # Sérialiser les mots de passe en JSON
+            passwords_data = [{'id': p.id, 'user': p.user.id, 'site_name': p.site_name, 'site_url': p.site_url,
+                               'username': p.username, 'password': p.password, 'created_at': p.created_at,
+                               'updated_at': p.updated_at} for p in passwords]
+            return JsonResponse(passwords_data, safe=False)
 
-                return response
-            else:
-                # Si le format spécifié n'est ni JSON ni CSV, retourner une erreur
-                return JsonResponse({'error': 'Invalid format specified'}, status=400)
-        except Exception as e:
-            # En cas d'erreur, retourner un message d'erreur
-            return JsonResponse({'error': str(e)}, status=500)
-    else:
-        # Si la méthode HTTP n'est pas autorisée, retourner un message approprié
-        return JsonResponse({'message': 'Method not allowed'}, status=405)
+        elif export_format == 'csv':
+            # Créer un fichier CSV temporaire
+            response = HttpResponse(content_type='text/csv')
+            response['Content-Disposition'] = 'attachment; filename="passwords.csv"'
+            writer = csv.writer(response)
+            writer.writerow(['id', 'user', 'site_name', 'site_url', 'username', 'password', 'created_at', 'updated_at'])
+            for password in passwords:
+                writer.writerow([password.id, password.user.id, password.site_name, password.site_url,
+                                 password.username, password.password, password.created_at, password.updated_at])
+            return response
+
+        else:
+            return JsonResponse({'error': 'Invalid format specified'}, status=400)
+    
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=500)
+
+
 
 ################### USERS ##########################
 
-@api_view(['POST']) #connection 
+
+# Utiliser le modèle utilisateur configuré dans le projet
+
+logger = logging.getLogger(__name__)
+
+@api_view(['POST'])
+@ratelimit(key='ip', rate='5/m', method='POST', block=True)
 def user_login(request):
+    logger = logging.getLogger(__name__)
+    logger.info("user_login called")
+
     if request.method == 'POST':
         username = request.data.get('username')
         password = request.data.get('password')
+        logger.info(f"Username: {username}, Password: {'*' * len(password)}")
+
+        if not username or not password:
+            logger.warning("Username and password are required")
+            return Response({'error': 'Username and password are required.'}, status=400)
+
         user = authenticate(request, username=username, password=password)
+        
         if user is not None:
-            login(request, user)
-            return JsonResponse({'message': 'Login successful'}, status=200)
+            login(request, user)  # Met à jour automatiquement last_login
+            logger.info(f"User {username} authenticated successfully")
+
+            refresh = RefreshToken.for_user(user)
+            return Response({
+                'refresh': str(refresh),
+                'access': str(refresh.access_token),
+                'user': {
+                    'id': user.id,
+                    'username': user.username,
+                    'email': user.email,
+                    'last_login': user.last_login,
+                }
+            }, status=200)
         else:
-            return JsonResponse({'message': 'Invalid username or password'}, status=400)
+            logger.warning(f"Invalid username or password for user {username}")
+            return Response({'error': 'Invalid username or password'}, status=400)
 
 
-@api_view(['POST']) #création d'un nouvel utilisateur
-def user_register(request):
-    serializer = UserSerializer(data=request.data)
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def send_2fa_code(request):
+    serializer = TwoFactorSerializer(data=request.data)
+    
     if serializer.is_valid():
+        username = serializer.validated_data['username']
+        code = serializer.validated_data['code']
+        
+        try:
+            user = User.objects.get(username=username)
+            email = user.email
+            
+            send_mail(
+                'Votre code de vérification 2FA',
+                f'Votre code de vérification est : {code}',
+                'no-reply@votreapp.com',
+                [email],
+                fail_silently=False,
+            )
+            return Response({'message': '2FA code sent successfully'}, status=status.HTTP_200_OK)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+    
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def user_register(request):
+    # Sérialisation des données de la requête
+    serializer = UserSerializer(data=request.data)
+    
+    if serializer.is_valid():
+        # Extraction des informations de l'utilisateur à partir des données sérialisées
         username = serializer.validated_data.get('username')
         email = serializer.validated_data.get('email')
         first_name = serializer.validated_data.get('first_name')
         last_name = serializer.validated_data.get('last_name')
-        password = request.data.get('password')  # Assuming password is still required for creation
+        password = request.data.get('password')  # Le mot de passe est toujours requis pour la création
 
+        # Vérification si le champ du mot de passe est vide
         if not password:
-            return Response({'message': 'Password is required'}, status=status.HTTP_400_BAD_REQUEST)
+            logger.warning("Password is required")
+            return Response({'message': 'Le mot de passe est requis'}, status=status.HTTP_400_BAD_REQUEST)
         
+        # Vérification de l'unicité du nom d'utilisateur
         if User.objects.filter(username=username).exists():
-            return Response({'message': 'Username already exists'}, status=status.HTTP_400_BAD_REQUEST)
+            logger.warning(f"Username '{username}' already exists")
+            return Response({'message': 'Le nom d\'utilisateur existe déjà'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            validate_password(password)
+        except Exception as e:
+            logger.warning(f"Password validation error: {e}")
+            return Response({'message': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         
         user = User.objects.create_user(
             username=username,
@@ -360,10 +555,13 @@ def user_register(request):
         )
         
         if user:
-            return Response({'message': 'Registration successful', 'user': UserSerializer(user).data}, status=status.HTTP_201_CREATED)
+            logger.info(f"User '{username}' registered successfully")
+            return Response({'message': 'Inscription réussie', 'user': UserSerializer(user).data}, status=status.HTTP_201_CREATED)
         else:
-            return Response({'message': 'Registration failed'}, status=status.HTTP_400_BAD_REQUEST)
+            logger.error("User registration failed")
+            return Response({'message': 'Échec de l\'inscription'}, status=status.HTTP_400_BAD_REQUEST)
     else:
+        logger.warning(f"User registration validation errors: {serializer.errors}")
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
 
@@ -404,6 +602,35 @@ def get_user_profile(request):
     user = request.user
     serializer = UserSerializer(user)
     return Response(serializer.data)
+
+logger = logging.getLogger(__name__)
+
+class GetUserPasswords(APIView):
+    def get(self, request, user_id):
+        try:
+            logger.debug(f"Fetching user with ID: {user_id}")
+            user = User.objects.get(pk=user_id)
+            logger.debug("User found, fetching passwords...")
+            
+            # Assurez-vous que l'attribut 'passwordentry_set' existe
+            passwords = [
+                {'site_name': p.site_name, 'password': p.get_decrypted_password()} 
+                for p in user.passwordentry_set.all()
+            ]
+            
+            logger.debug("Passwords fetched and decrypted successfully.")
+            return Response({'passwords': passwords})
+        
+        except User.DoesNotExist:
+            logger.error("User not found.")
+            return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}", exc_info=True)
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+
+
 
 
 

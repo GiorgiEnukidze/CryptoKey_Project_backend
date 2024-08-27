@@ -1,3 +1,4 @@
+# api/urls.py
 
 from django.urls import path
 from .views import (
@@ -7,15 +8,14 @@ from .views import (
     CreditCardListCreateView, CreditCardDetailView,
     IdentityCardListCreateView, IdentityCardDetailView,
     EncryptionKeyListCreateView, EncryptionKeyDetailView,
-    
-    check_password,import_passwords, export_passwords,share_password,
-    add_password, password_list, delete_password,update_password,
-    secure_note_list,add_secure_note,update_secure_note,delete_secure_note,
-    identity_card_list,add_identity_card,update_identity_card,delete_identity_card,
-    credit_card_list,add_credit_card,update_credit_card,delete_credit_card,
-    encryption_key_list,add_encryption_key,update_encryption_key,delete_encryption_key,
-    UserListView, UserDetailView,MyTokenObtainPairView,
-    user_register, user_login, get_user_profile, update_profile,
+    check_password, import_passwords, export_passwords, share_password,
+    add_password, password_list, delete_password, update_password,
+    secure_note_list, add_secure_note, update_secure_note, delete_secure_note,
+    identity_card_list, add_identity_card, update_identity_card, delete_identity_card,
+    credit_card_list, add_credit_card, update_credit_card, delete_credit_card,
+    encryption_key_list, add_encryption_key, update_encryption_key, delete_encryption_key,
+    UserListView, UserDetailView, MyTokenObtainPairView, UserDeleteView, UserUpdateView, NotifyPasswordLeakView, StatisticsView,
+    user_register, user_login, get_user_profile, update_profile,send_2fa_code,GetUserPasswords,
 )
 
 urlpatterns = [
@@ -35,9 +35,6 @@ urlpatterns = [
     path('users/<int:pk>/', UserDetailView.as_view(), name='user-detail'),
     path('token/', MyTokenObtainPairView.as_view(), name='token_obtain_pair'),
     
-
-
-    
     path('profile/', get_user_profile, name='get_user_profile'),
     path('register/', user_register, name='register'),
     path('profile/update/<int:user_id>/', update_profile, name='update_profile'),
@@ -48,7 +45,6 @@ urlpatterns = [
     path('passwords/add/', add_password, name='add_password'),
     path('passwords/update/<int:password_id>/', update_password, name='update_password'),
     path('passwords/delete/<int:password_id>/', delete_password, name='delete_password'),
-
 
     # Secure Note
     path('notes/', secure_note_list, name='secure_note_list'),
@@ -80,4 +76,20 @@ urlpatterns = [
     path('export/', export_passwords, name='export_passwords'),
 
     path('import/', import_passwords, name='export_passwords'),
-    ]
+
+    # admin
+    path('users/', UserListView.as_view(), name='user-list'),
+    path('users/<int:pk>/', UserDetailView.as_view(), name='user-detail'),
+    path('users/<int:pk>/delete/', UserDeleteView.as_view(), name='user-delete'),
+    path('users/<int:pk>/update/', UserUpdateView.as_view(), name='user-update'),
+    path('users/<int:user_id>/passwords/', GetUserPasswords.as_view(), name='get_user_passwords'),
+    path('users/<int:pk>/notify_password_leak/', NotifyPasswordLeakView.as_view(), name='notify-password-leak'),
+
+    # stats and logs
+    path('statistics/', StatisticsView.as_view(), name='statistics'),
+    
+
+
+    path('send_2fa/', send_2fa_code, name='send_2fa_code'),
+
+]
