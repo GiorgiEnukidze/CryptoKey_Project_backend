@@ -505,7 +505,7 @@ def send_2fa_code(request):
             send_mail(
                 'Votre code de vérification 2FA',
                 f'Votre code de vérification est : {code}',
-                'no-reply@votreapp.com',
+                'admin@lebourbier.be',  # Utilisez une adresse e-mail valide de votre domaine
                 [email],
                 fail_silently=False,
             )
@@ -514,7 +514,6 @@ def send_2fa_code(request):
             return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
     
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
 
 @api_view(['POST'])
 @permission_classes([AllowAny])

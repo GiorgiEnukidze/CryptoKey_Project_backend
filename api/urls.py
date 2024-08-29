@@ -14,8 +14,8 @@ from .views import (
     identity_card_list, add_identity_card, update_identity_card, delete_identity_card,
     credit_card_list, add_credit_card, update_credit_card, delete_credit_card,
     encryption_key_list, add_encryption_key, update_encryption_key, delete_encryption_key,
-    UserListView, UserDetailView, MyTokenObtainPairView, UserDeleteView, UserUpdateView, NotifyPasswordLeakView, StatisticsView,
-    user_register, user_login, get_user_profile, update_profile,send_2fa_code,GetUserPasswords,
+    UserListView, UserDetailView, MyTokenObtainPairView, UserDeleteView, UserUpdateView, NotifyPasswordLeakView, StatisticsView,GetUserPasswords,
+    user_register, user_login, get_user_profile, update_profile,send_2fa_code,
 )
 
 urlpatterns = [
